@@ -20,7 +20,7 @@ def load_model():
     global tts_model
     if tts_model is not None: return tts_model
     from chatterbox.tts import ChatterboxTTS
-    device = "cuda" if torch.cuda.is_available() else return {"error": "No cuda"}
+    device = "cuda"
     tts_model = ChatterboxTTS.from_pretrained(device=device)
     return tts_model
 
