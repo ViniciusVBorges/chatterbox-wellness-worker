@@ -16,7 +16,7 @@
     }
   ],
   "config": {
-    "gpuTypeId": "NVIDIA GeForce RTX 4090",
+    "gpuTypeId": "NVIDIA H100 80GB HBM3",
     "gpuCount": 1,
     "env": [],
     "allowedCudaVersions": [
