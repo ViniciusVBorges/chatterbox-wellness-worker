@@ -20,7 +20,7 @@ def load_model():
     global tts_model
     if tts_model is not None: return tts_model
     from chatterbox.tts import ChatterboxTTS
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda"
     tts_model = ChatterboxTTS.from_pretrained(device=device)
     return tts_model
 
@@ -49,7 +49,7 @@ def handler(job: dict) -> dict:
     speed = job_input.get("speed", 1.0)
 
     try:
-        model = load_model()
+        
         text_chunks = split_text_into_chunks(text)
         
         # Criar o tensor de silêncio (Padding)
@@ -117,7 +117,7 @@ print("[Handler] Pre-loading model...")
 
 try:
 
-    load_model()
+    model = load_model()
 
 except Exception as e:
 
