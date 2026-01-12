@@ -6,13 +6,6 @@
         "health_check": true
       },
       "timeout": 60000
-    },
-    {
-      "name": "basic_tts",
-      "input": {
-        "text": "Hello."
-      },
-      "timeout": 120000
     }
   ],
   "config": {
