@@ -113,4 +113,15 @@ def handler(job: dict) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+print("[Handler] Pre-loading model...")
+
+try:
+
+    load_model()
+
+except Exception as e:
+
+    print(f"[Handler] Warning: Could not pre-load model: {e}")
+    
+
 runpod.serverless.start({"handler": handler})
