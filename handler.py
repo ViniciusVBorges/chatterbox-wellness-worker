@@ -39,6 +39,14 @@ def split_text_into_chunks(text, chunk_size=200):
 
 def handler(job: dict) -> dict:
     job_input = job.get("input", {})
+
+     if job_input.get("health_check"):
+        return {
+            "status": "healthy",
+            "message": "Chatterbox TTS handler ready",
+            "model_loaded": tts_model is not None
+        }
+         
     text = job_input.get("text", "")
     if not text: return {"error": "No text provided"}
 
