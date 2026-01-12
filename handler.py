@@ -9,21 +9,25 @@ import tempfile
 import urllib.request
 import numpy as np
 
-# --- Configurações de Áudio ---
+# --- Configurações ---
 SAMPLE_RATE = 24000
-SILENCE_DURATION = 0.15  # Segundos de silêncio entre cada frase (chunk)
+SILENCE_DURATION = 0.15 
 
 # Global model instance
-tts_model = None
+model = None
 
 def load_model():
-    global tts_model
-    if tts_model is not None: return tts_model
+    global model
+    if model is not None: 
+        return model
+    
     from chatterbox.tts import ChatterboxTTS
-    device = "cuda"
-    device = "cuda" if torch.cuda.is_available() else "cpu" 
-    print(f"[Handler] Using device: {device}")
-    return tts_model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Handler] Loading model on: {device}")
+    
+    # Instantiate the model
+    model = ChatterboxTTS(device=device)
+    return model
 
 def split_text_into_chunks(text, chunk_size=200):
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
@@ -39,9 +43,7 @@ def split_text_into_chunks(text, chunk_size=200):
     return chunks
 
 def download_reference_audio(url: str) -> str:
-    """Download reference audio from URL to temp file."""
     temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-
     try:
         urllib.request.urlretrieve(url, temp_file.name)
         return temp_file.name
@@ -49,13 +51,9 @@ def download_reference_audio(url: str) -> str:
         os.unlink(temp_file.name)
         raise Exception(f"Failed to download reference audio: {e}")
 
-
 def base64_to_audio_file(b64_data: str) -> str:
-    """Convert base64 audio to temp file."""
-    # Remove data URL prefix if present
     if "," in b64_data:
         b64_data = b64_data.split(",")[1]
-
     audio_bytes = base64.b64decode(b64_data)
     temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     temp_file.write(audio_bytes)
@@ -63,10 +61,14 @@ def base64_to_audio_file(b64_data: str) -> str:
     return temp_file.name
 
 def handler(job: dict) -> dict:
+    # Ensure model is loaded
+    global model
+    if model is None:
+        model = load_model()
+
     job_input = job.get("input", {})
     text = job_input.get("text", "")
     if not text: return {"error": "No text provided"}
-
 
     ref_url = job_input.get("reference_audio_url")
     ref_audio_base64 = job_input.get("reference_audio_base64")
@@ -75,26 +77,19 @@ def handler(job: dict) -> dict:
     speed = job_input.get("speed", 1.0)
 
     try:
-        
         text_chunks = split_text_into_chunks(text)
-        
-        # Criar o tensor de silêncio (Padding)
-        # 
         silence_samples = int(SAMPLE_RATE * SILENCE_DURATION)
         silence_tensor = torch.zeros((1, silence_samples))
 
         audio_list = []
         ref_path = None
+        
         if ref_url:
-            print(f"[Handler] Downloading reference audio from URL...")
-            ref_path = download_reference_audio(ref_audio_url)
+            ref_path = download_reference_audio(ref_url) # Fixed variable name
         elif ref_audio_base64:
-            print(f"[Handler] Decoding reference audio from base64...")
             ref_path = base64_to_audio_file(ref_audio_base64)
 
         for i, chunk in enumerate(text_chunks):
-            print(f"[Handler] Gerando chunk {i+1}/{len(text_chunks)}")
-            
             with torch.no_grad():
                 wav = model.generate(
                     text=chunk,
@@ -106,30 +101,24 @@ def handler(job: dict) -> dict:
             if wav.dim() == 1: wav = wav.unsqueeze(0)
             audio_list.append(wav.cpu())
 
-            # Adiciona o silêncio após o chunk, exceto no último
             if i < len(text_chunks) - 1:
                 audio_list.append(silence_tensor)
 
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-        # Concatenação final
         final_audio = torch.cat(audio_list, dim=1)
 
-        # Ajuste de velocidade se necessário
         if speed != 1.0:
             import torchaudio.transforms as T
             resampler = T.Resample(orig_freq=int(SAMPLE_RATE * speed), new_freq=SAMPLE_RATE)
             final_audio = resampler(final_audio)
 
-        # Normalização para evitar clipping
         final_audio = final_audio / (torch.max(torch.abs(final_audio)) + 1e-9) * 0.9
 
-        # Conversão Base64
         buffer = io.BytesIO()
         ta.save(buffer, final_audio, SAMPLE_RATE, format="WAV")
         audio_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-        if ref_path: os.unlink(ref_path)
+        if ref_path and os.path.exists(ref_path): 
+            os.unlink(ref_path)
 
         return {
             "audio_base64": audio_b64,
@@ -140,15 +129,11 @@ def handler(job: dict) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+# Pre-warm the model
 print("[Handler] Pre-loading model...")
-
 try:
-
     model = load_model()
-
 except Exception as e:
-
     print(f"[Handler] Warning: Could not pre-load model: {e}")
-    
 
 runpod.serverless.start({"handler": handler})
