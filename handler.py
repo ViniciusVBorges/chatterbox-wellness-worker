@@ -1,219 +1,116 @@
-"""
-RunPod Serverless Handler for Chatterbox TTS
-Text-to-Speech with voice cloning and emotion control
-
-Based on: https://github.com/geronimi73/runpod_chatterbox
-"""
-
 import runpod
-import base64
-import io
+import torch
+import torchaudio as ta
+import re
 import os
+import io
+import base64
 import tempfile
 import urllib.request
-from typing import Optional
-
-import torch
-import soundfile as sf
 import numpy as np
 
-# Global model instance (loaded once per worker)
+# --- Configurações de Áudio ---
+SAMPLE_RATE = 24000
+SILENCE_DURATION = 0.15  # Segundos de silêncio entre cada frase (chunk)
+
+# Global model instance
 tts_model = None
 
-
 def load_model():
-    """Load Chatterbox TTS model."""
     global tts_model
-
-    if tts_model is not None:
-        return tts_model
-
-    print("[Handler] Loading Chatterbox TTS model...")
-
+    if tts_model is not None: return tts_model
     from chatterbox.tts import ChatterboxTTS
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[Handler] Using device: {device}")
-
     tts_model = ChatterboxTTS.from_pretrained(device=device)
-
-    print("[Handler] Model loaded successfully")
     return tts_model
 
-
-def download_reference_audio(url: str) -> str:
-    """Download reference audio from URL to temp file."""
-    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-
-    try:
-        urllib.request.urlretrieve(url, temp_file.name)
-        return temp_file.name
-    except Exception as e:
-        os.unlink(temp_file.name)
-        raise Exception(f"Failed to download reference audio: {e}")
-
-
-def base64_to_audio_file(b64_data: str) -> str:
-    """Convert base64 audio to temp file."""
-    # Remove data URL prefix if present
-    if "," in b64_data:
-        b64_data = b64_data.split(",")[1]
-
-    audio_bytes = base64.b64decode(b64_data)
-    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    temp_file.write(audio_bytes)
-    temp_file.close()
-    return temp_file.name
-
-
-def audio_to_base64(audio_array: np.ndarray, sample_rate: int = 24000) -> str:
-    """Convert audio array to base64 encoded WAV."""
-    buffer = io.BytesIO()
-    sf.write(buffer, audio_array, sample_rate, format="WAV")
-    buffer.seek(0)
-    return base64.b64encode(buffer.read()).decode("utf-8")
-
-
-def parse_emotion_tags(text: str) -> tuple[str, Optional[str]]:
-    """
-    Parse emotion tags from text.
-    Format: [happy] Hello there! or <emotion:sad> How are you?
-    Returns: (clean_text, emotion)
-    """
-    import re
-
-    # Check for [emotion] format
-    bracket_match = re.match(r"^\[(\w+)\]\s*(.+)$", text, re.DOTALL)
-    if bracket_match:
-        return bracket_match.group(2).strip(), bracket_match.group(1).lower()
-
-    # Check for <emotion:name> format
-    tag_match = re.match(r"^<emotion:(\w+)>\s*(.+)$", text, re.DOTALL)
-    if tag_match:
-        return tag_match.group(2).strip(), tag_match.group(1).lower()
-
-    return text, None
-
+def split_text_into_chunks(text, chunk_size=200):
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    chunks = []
+    current_chunk = ""
+    for sentence in sentences:
+        if (len(current_chunk) + len(sentence) + 1 > chunk_size) and current_chunk:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence
+        else:
+            current_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
+    if current_chunk: chunks.append(current_chunk.strip())
+    return chunks
 
 def handler(job: dict) -> dict:
-    """Main RunPod handler function."""
-
     job_input = job.get("input", {})
-
-    # Health check - respond immediately without generating audio
-    if job_input.get("health_check"):
-        return {
-            "status": "healthy",
-            "message": "Chatterbox TTS handler ready",
-            "model_loaded": tts_model is not None
-        }
-
-    # Required: text to synthesize
     text = job_input.get("text", "")
-    if not text:
-        return {"error": "No text provided"}
+    if not text: return {"error": "No text provided"}
 
-    # Optional: reference audio for voice cloning
-    reference_audio_url = job_input.get("reference_audio_url")
-    reference_audio_base64 = job_input.get("reference_audio_base64")
-
-    # Optional: emotion override (if not in text tags)
-    emotion = job_input.get("emotion")
-
-    # Optional: generation parameters
-    temperature = job_input.get("temperature", 0.7)
-    exaggeration = job_input.get("exaggeration", 1.0)
+    # Parametros do modelo
+    ref_url = job_input.get("reference_audio_url")
+    temp = job_input.get("temperature", 0.7)
+    exag = job_input.get("exaggeration", 1.0)
     speed = job_input.get("speed", 1.0)
-    cfg_weight = job_input.get("cfg_weight", 0.5)
-
-    # Parse emotion from text if not provided
-    clean_text, text_emotion = parse_emotion_tags(text)
-    if text_emotion and not emotion:
-        emotion = text_emotion
-        text = clean_text
 
     try:
-        # Load model
         model = load_model()
+        text_chunks = split_text_into_chunks(text)
+        
+        # Criar o tensor de silêncio (Padding)
+        # 
+        silence_samples = int(SAMPLE_RATE * SILENCE_DURATION)
+        silence_tensor = torch.zeros((1, silence_samples))
 
-        # Handle reference audio
-        ref_audio_path = None
+        audio_list = []
+        ref_path = None
+        if ref_url:
+            # Download simplificado (como no seu código original)
+            temp_f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            urllib.request.urlretrieve(ref_url, temp_f.name)
+            ref_path = temp_f.name
 
-        if reference_audio_url:
-            print(f"[Handler] Downloading reference audio from URL...")
-            ref_audio_path = download_reference_audio(reference_audio_url)
-        elif reference_audio_base64:
-            print(f"[Handler] Decoding reference audio from base64...")
-            ref_audio_path = base64_to_audio_file(reference_audio_base64)
+        for i, chunk in enumerate(text_chunks):
+            print(f"[Handler] Gerando chunk {i+1}/{len(text_chunks)}")
+            
+            with torch.no_grad():
+                wav = model.generate(
+                    text=chunk,
+                    audio_prompt_path=ref_path,
+                    temperature=temp,
+                    exaggeration=exag
+                )
+            
+            if wav.dim() == 1: wav = wav.unsqueeze(0)
+            audio_list.append(wav.cpu())
 
-        # Generate speech
-        print(f"[Handler] Generating speech for: {text[:50]}...")
-        print(f"[Handler] Emotion: {emotion}, Temp: {temperature}, Speed: {speed}")
+            # Adiciona o silêncio após o chunk, exceto no último
+            if i < len(text_chunks) - 1:
+                audio_list.append(silence_tensor)
 
-        if ref_audio_path:
-            # Voice cloning mode
-            audio = model.generate(
-                text=text,
-                audio_prompt_path=ref_audio_path,
-                temperature=temperature,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-            )
-            # Clean up temp file
-            os.unlink(ref_audio_path)
-        else:
-            # Default voice mode
-            audio = model.generate(
-                text=text,
-                temperature=temperature,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-            )
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-        # Apply speed adjustment if not 1.0
+        # Concatenação final
+        final_audio = torch.cat(audio_list, dim=1)
+
+        # Ajuste de velocidade se necessário
         if speed != 1.0:
-            from scipy import signal
-            # Resample to adjust speed
-            original_length = len(audio)
-            new_length = int(original_length / speed)
-            audio = signal.resample(audio, new_length)
+            import torchaudio.transforms as T
+            resampler = T.Resample(orig_freq=int(SAMPLE_RATE * speed), new_freq=SAMPLE_RATE)
+            final_audio = resampler(final_audio)
 
-        # Convert to numpy if tensor
-        if hasattr(audio, "cpu"):
-            audio = audio.cpu().numpy()
+        # Normalização para evitar clipping
+        final_audio = final_audio / (torch.max(torch.abs(final_audio)) + 1e-9) * 0.9
 
-        # Ensure 1D
-        if len(audio.shape) > 1:
-            audio = audio.squeeze()
+        # Conversão Base64
+        buffer = io.BytesIO()
+        ta.save(buffer, final_audio, SAMPLE_RATE, format="WAV")
+        audio_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-        # Normalize
-        audio = audio / np.max(np.abs(audio)) * 0.95
-
-        # Convert to base64
-        audio_b64 = audio_to_base64(audio, sample_rate=24000)
+        if ref_path: os.unlink(ref_path)
 
         return {
             "audio_base64": audio_b64,
-            "sample_rate": 24000,
-            "duration_seconds": len(audio) / 24000,
-            "text": text,
-            "emotion": emotion,
+            "duration": final_audio.shape[1] / SAMPLE_RATE,
+            "chunks": len(text_chunks)
         }
 
     except Exception as e:
-        import traceback
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
+        return {"error": str(e)}
 
-
-# Pre-load model on worker start
-print("[Handler] Pre-loading model...")
-try:
-    load_model()
-except Exception as e:
-    print(f"[Handler] Warning: Could not pre-load model: {e}")
-
-# RunPod serverless entry point
 runpod.serverless.start({"handler": handler})
