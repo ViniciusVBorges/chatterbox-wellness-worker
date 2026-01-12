@@ -87,10 +87,10 @@ def handler(job: dict) -> dict:
         ref_path = None
         if ref_url:
             print(f"[Handler] Downloading reference audio from URL...")
-            ref_path = download_reference_audio(reference_audio_url)
+            ref_path = download_reference_audio(ref_audio_url)
         elif ref_audio_base64:
             print(f"[Handler] Decoding reference audio from base64...")
-            ref_path = base64_to_audio_file(reference_audio_base64)
+            ref_path = base64_to_audio_file(ref_audio_base64)
 
         for i, chunk in enumerate(text_chunks):
             print(f"[Handler] Gerando chunk {i+1}/{len(text_chunks)}")
