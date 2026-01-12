@@ -21,7 +21,8 @@ def load_model():
     if tts_model is not None: return tts_model
     from chatterbox.tts import ChatterboxTTS
     device = "cuda"
-    tts_model = ChatterboxTTS.from_pretrained(device=device)
+    device = "cuda" if torch.cuda.is_available() else "cpu" 
+    print(f"[Handler] Using device: {device}")
     return tts_model
 
 def split_text_into_chunks(text, chunk_size=200):
@@ -37,13 +38,38 @@ def split_text_into_chunks(text, chunk_size=200):
     if current_chunk: chunks.append(current_chunk.strip())
     return chunks
 
+def download_reference_audio(url: str) -> str:
+    """Download reference audio from URL to temp file."""
+    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+
+    try:
+        urllib.request.urlretrieve(url, temp_file.name)
+        return temp_file.name
+    except Exception as e:
+        os.unlink(temp_file.name)
+        raise Exception(f"Failed to download reference audio: {e}")
+
+
+def base64_to_audio_file(b64_data: str) -> str:
+    """Convert base64 audio to temp file."""
+    # Remove data URL prefix if present
+    if "," in b64_data:
+        b64_data = b64_data.split(",")[1]
+
+    audio_bytes = base64.b64decode(b64_data)
+    temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    temp_file.write(audio_bytes)
+    temp_file.close()
+    return temp_file.name
+
 def handler(job: dict) -> dict:
     job_input = job.get("input", {})
     text = job_input.get("text", "")
     if not text: return {"error": "No text provided"}
 
-    # Parametros do modelo
+
     ref_url = job_input.get("reference_audio_url")
+    ref_audio_base64 = job_input.get("reference_audio_base64")
     temp = job_input.get("temperature", 0.7)
     exag = job_input.get("exaggeration", 1.0)
     speed = job_input.get("speed", 1.0)
@@ -60,10 +86,11 @@ def handler(job: dict) -> dict:
         audio_list = []
         ref_path = None
         if ref_url:
-            # Download simplificado (como no seu código original)
-            temp_f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            urllib.request.urlretrieve(ref_url, temp_f.name)
-            ref_path = temp_f.name
+            print(f"[Handler] Downloading reference audio from URL...")
+            ref_path = download_reference_audio(reference_audio_url)
+        elif ref_audio_base64:
+            print(f"[Handler] Decoding reference audio from base64...")
+            ref_path = base64_to_audio_file(reference_audio_base64)
 
         for i, chunk in enumerate(text_chunks):
             print(f"[Handler] Gerando chunk {i+1}/{len(text_chunks)}")
