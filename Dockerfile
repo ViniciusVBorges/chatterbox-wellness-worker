@@ -32,14 +32,18 @@ RUN pip install --no-cache-dir \
     torchaudio \
     omegaconf \
     pyloudnorm \
-    runpod
+    runpod \
+    faster-whisper
 
 # Copy handler
 COPY handler.py /app/handler.py
 
-# Pre-download model during build (Isso economiza ~2GB de download em cada boot do worker)
-# 
-RUN python -c "from chatterbox.tts import ChatterboxTTS; print('Pre-loading model...'); ChatterboxTTS.from_pretrained(device='cpu')"
+# Pre-download models during build (economiza download em cada boot do worker)
+# TTS Model (~2GB)
+RUN python -c "from chatterbox.tts import ChatterboxTTS; print('Pre-loading TTS model...'); ChatterboxTTS.from_pretrained(device='cpu')"
+
+# Whisper Model (base ~140MB)
+RUN python -c "from faster_whisper import WhisperModel; print('Pre-loading Whisper model...'); WhisperModel('base', device='cpu', compute_type='int8')"
 
 # Start handler
 CMD ["python", "-u", "/app/handler.py"]
