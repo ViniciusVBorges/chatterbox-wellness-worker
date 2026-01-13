@@ -284,7 +284,7 @@ def handler(job: dict) -> dict:
         
         for i, chunk in enumerate(text_chunks):
             print(f"\n[Handler] === Chunk {i+1}/{len(text_chunks)} ===")
-            print(f"[Handler] Text: '{chunk[:80]}...'")
+            print(f"[Handler] Text: '{chunk}'")
             
             audio, metadata = generate_chunk_with_validation(
                 model=model,
@@ -299,7 +299,7 @@ def handler(job: dict) -> dict:
             audio_list.append(audio)
             chunk_metadata.append({
                 "chunk_index": i + 1,
-                "text": chunk[:100] + "..." if len(chunk) > 100 else chunk,
+                "text": chunk,
                 **metadata
             })
             
