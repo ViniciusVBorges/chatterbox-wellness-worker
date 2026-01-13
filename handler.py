@@ -11,6 +11,8 @@ import numpy as np
 import string
 import difflib
 import gc
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configurações ---
 SAMPLE_RATE = 24000
@@ -20,25 +22,56 @@ TEMP_DIR = "/tmp/tts_temp"  # Local temp storage (deleted after execution)
 WHISPER_THRESHOLD = 0.85  # Minimum similarity score to accept audio
 DEFAULT_CHUNK_SIZE = 200  # Default chunk size in characters
 MAX_RETRY_ATTEMPTS = 3    # Max attempts per chunk if validation fails
+DEFAULT_PARALLEL_WORKERS = 1  # Default: sequential processing
+NUM_TTS_MODELS = 2  # Number of TTS model instances to load (for parallel GPU processing)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # Global model instances
-tts_model = None
+tts_models = []  # Pool of TTS models
+tts_model_locks = []  # Locks for thread-safe access
 whisper_model = None
 
 
-def load_tts_model():
-    """Load the ChatterboxTTS model."""
-    global tts_model
-    if tts_model is not None:
-        return tts_model
+def load_tts_models(num_models: int = NUM_TTS_MODELS):
+    """Load multiple ChatterboxTTS model instances for parallel processing."""
+    global tts_models, tts_model_locks
+    
+    if len(tts_models) >= num_models:
+        return tts_models
+    
     from chatterbox.tts import ChatterboxTTS
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    tts_model = ChatterboxTTS.from_pretrained(device=device)
-    print(f"[Handler] TTS model loaded on {device}")
-    return tts_model
+    
+    for i in range(num_models):
+        print(f"[Handler] Loading TTS model instance {i+1}/{num_models}...")
+        model = ChatterboxTTS.from_pretrained(device=device)
+        tts_models.append(model)
+        tts_model_locks.append(threading.Lock())
+        print(f"[Handler] TTS model {i+1} loaded on {device}")
+    
+    return tts_models
+
+
+def get_available_model():
+    """Get an available model from the pool (thread-safe)."""
+    for i, (model, lock) in enumerate(zip(tts_models, tts_model_locks)):
+        if lock.acquire(blocking=False):
+            return i, model, lock
+    
+    # All models busy, wait for first available
+    i = 0
+    tts_model_locks[0].acquire()
+    return 0, tts_models[0], tts_model_locks[0]
+
+
+def release_model(lock: threading.Lock):
+    """Release a model back to the pool."""
+    try:
+        lock.release()
+    except RuntimeError:
+        pass  # Already released
 
 
 def load_whisper_model():
@@ -148,7 +181,6 @@ def base64_to_audio_file(b64_data: str) -> str:
 
 
 def generate_chunk_with_validation(
-    model,
     chunk_text: str,
     chunk_index: int,
     ref_path: str | None,
@@ -158,15 +190,24 @@ def generate_chunk_with_validation(
 ) -> tuple[torch.Tensor, dict]:
     """
     Generate audio for a chunk with Whisper validation.
+    Automatically acquires a model from the pool.
     Retries up to MAX_RETRY_ATTEMPTS if validation fails.
     Returns: (audio_tensor, metadata)
     """
     best_audio = None
     best_score = 0.0
     best_transcription = ""
+    model_idx = None
+    model = None
+    lock = None
     
-    for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-        print(f"[Chunk {chunk_index}] Attempt {attempt}/{MAX_RETRY_ATTEMPTS}")
+    try:
+        # Acquire a model from the pool
+        model_idx, model, lock = get_available_model()
+        print(f"[Chunk {chunk_index}] Using model instance {model_idx + 1}")
+        
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            print(f"[Chunk {chunk_index}] Attempt {attempt}/{MAX_RETRY_ATTEMPTS}")
         
         # Generate audio
         with torch.no_grad():
@@ -181,13 +222,14 @@ def generate_chunk_with_validation(
             wav = wav.unsqueeze(0)
         
         # If bypassing Whisper, return immediately
-        if bypass_whisper:
-            return wav.cpu(), {
-                "validated": False,
-                "score": None,
-                "attempts": attempt,
-                "transcription": None
-            }
+            if bypass_whisper:
+                return wav.cpu(), {
+                    "validated": False,
+                    "score": None,
+                    "attempts": attempt,
+                    "transcription": None,
+                    "model_instance": model_idx + 1 if model_idx is not None else None
+                }
         
         # Save to temp file for Whisper validation
         temp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=TEMP_DIR)
@@ -214,7 +256,8 @@ def generate_chunk_with_validation(
                     "validated": True,
                     "score": score,
                     "attempts": attempt,
-                    "transcription": transcription
+                    "transcription": transcription,
+                    "model_instance": model_idx + 1 if model_idx is not None else None
                 }
             else:
                 print(f"[Chunk {chunk_index}] ✗ Failed validation (score: {score:.3f}), retrying...")
@@ -224,23 +267,31 @@ def generate_chunk_with_validation(
             if os.path.exists(temp_audio.name):
                 os.unlink(temp_audio.name)
         
-        # Clear CUDA cache between attempts
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # Clear CUDA cache between attempts
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # All attempts failed, return best one
+        print(f"[Chunk {chunk_index}] ⚠ All attempts failed, using best (score: {best_score:.3f})")
+        return best_audio, {
+            "validated": False,
+            "score": best_score,
+            "attempts": MAX_RETRY_ATTEMPTS,
+            "transcription": best_transcription,
+            "model_instance": model_idx + 1 if model_idx is not None else None
+        }
     
-    # All attempts failed, return best one
-    print(f"[Chunk {chunk_index}] ⚠ All attempts failed, using best (score: {best_score:.3f})")
-    return best_audio, {
-        "validated": False,
-        "score": best_score,
-        "attempts": MAX_RETRY_ATTEMPTS,
-        "transcription": best_transcription
-    }
+    finally:
+        # Always release the model back to the pool
+        if lock is not None:
+            release_model(lock)
 
 
 def handler(job: dict) -> dict:
     """Main RunPod handler function."""
-    model = load_tts_model()
+    # Ensure models are loaded
+    load_tts_models()
+    
     job_id = job.get("id")
     job_input = job.get("input", {})
     text = job_input.get("text", "")
@@ -256,6 +307,7 @@ def handler(job: dict) -> dict:
     speed = job_input.get("speed", 1.0)
     bypass_whisper = job_input.get("bypass_whisper", False)
     chunk_size = job_input.get("chunk_size", DEFAULT_CHUNK_SIZE)
+    parallel_workers = job_input.get("parallel_workers", DEFAULT_PARALLEL_WORKERS)
     
     ref_path = None
     chunk_metadata = []
@@ -281,38 +333,84 @@ def handler(job: dict) -> dict:
         # Generate and validate each chunk
         total_attempts = 0
         validated_chunks = 0
+        chunk_results = {}  # Store results by index
         
-        for i, chunk in enumerate(text_chunks):
-            print(f"\n[Handler] === Chunk {i+1}/{len(text_chunks)} ===")
-            print(f"[Handler] Text: '{chunk}'")
+        if parallel_workers > 1:
+            # Parallel processing
+            print(f"[Handler] Using parallel processing with {parallel_workers} workers")
             
-            audio, metadata = generate_chunk_with_validation(
-                model=model,
-                chunk_text=chunk,
-                chunk_index=i + 1,
-                ref_path=ref_path,
-                temp=temp,
-                exag=exag,
-                bypass_whisper=bypass_whisper
-            )
+            def process_chunk(args):
+                i, chunk = args
+                print(f"\n[Handler] === Chunk {i+1}/{len(text_chunks)} ===")
+                print(f"[Handler] Text: '{chunk}'")
+                audio, metadata = generate_chunk_with_validation(
+                    chunk_text=chunk,
+                    chunk_index=i + 1,
+                    ref_path=ref_path,
+                    temp=temp,
+                    exag=exag,
+                    bypass_whisper=bypass_whisper
+                )
+                return i, audio, metadata
             
-            audio_list.append(audio)
-            chunk_metadata.append({
-                "chunk_index": i + 1,
-                "text": chunk,
-                **metadata
-            })
+            with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                futures = {
+                    executor.submit(process_chunk, (i, chunk)): i 
+                    for i, chunk in enumerate(text_chunks)
+                }
+                
+                for future in as_completed(futures):
+                    i, audio, metadata = future.result()
+                    chunk_results[i] = (audio, metadata)
+                    total_attempts += metadata["attempts"]
+                    if metadata.get("validated"):
+                        validated_chunks += 1
+                    print(f"[Handler] Completed chunk {i+1}/{len(text_chunks)}")
             
-            total_attempts += metadata["attempts"]
-            if metadata.get("validated"):
-                validated_chunks += 1
-            
-            # Add silence between chunks
-            if i < len(text_chunks) - 1:
-                audio_list.append(silence_tensor)
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Reconstruct audio_list in order
+            for i in range(len(text_chunks)):
+                audio, metadata = chunk_results[i]
+                audio_list.append(audio)
+                chunk_metadata.append({
+                    "chunk_index": i + 1,
+                    "text": text_chunks[i],
+                    **metadata
+                })
+                if i < len(text_chunks) - 1:
+                    audio_list.append(silence_tensor)
+        else:
+            # Sequential processing (original behavior)
+            print(f"[Handler] Using sequential processing")
+            for i, chunk in enumerate(text_chunks):
+                print(f"\n[Handler] === Chunk {i+1}/{len(text_chunks)} ===")
+                print(f"[Handler] Text: '{chunk}'")
+                
+                audio, metadata = generate_chunk_with_validation(
+                    chunk_text=chunk,
+                    chunk_index=i + 1,
+                    ref_path=ref_path,
+                    temp=temp,
+                    exag=exag,
+                    bypass_whisper=bypass_whisper
+                )
+                
+                audio_list.append(audio)
+                chunk_metadata.append({
+                    "chunk_index": i + 1,
+                    "text": chunk,
+                    **metadata
+                })
+                
+                total_attempts += metadata["attempts"]
+                if metadata.get("validated"):
+                    validated_chunks += 1
+                
+                # Add silence between chunks
+                if i < len(text_chunks) - 1:
+                    audio_list.append(silence_tensor)
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         # Concatenate all audio
         final_audio = torch.cat(audio_list, dim=1)
@@ -365,9 +463,9 @@ def handler(job: dict) -> dict:
 # Pre-loading models
 print("[Handler] Pre-loading models...")
 try:
-    load_tts_model()
+    load_tts_models(NUM_TTS_MODELS)  # Load multiple TTS instances
     load_whisper_model()
-    print("[Handler] All models loaded successfully")
+    print(f"[Handler] All models loaded successfully ({NUM_TTS_MODELS} TTS instances)")
 except Exception as e:
     print(f"[Handler] Warning: Could not pre-load models: {e}")
 
