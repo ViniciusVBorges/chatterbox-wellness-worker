@@ -22,8 +22,8 @@ TEMP_DIR = "/tmp/tts_temp"  # Local temp storage (deleted after execution)
 WHISPER_THRESHOLD = 0.85  # Minimum similarity score to accept audio
 DEFAULT_CHUNK_SIZE = 200  # Default chunk size in characters
 MAX_RETRY_ATTEMPTS = 3    # Max attempts per chunk if validation fails
-DEFAULT_PARALLEL_WORKERS = 1  # Default: sequential processing
-NUM_TTS_MODELS = 2  # Number of TTS model instances to load (for parallel GPU processing)
+DEFAULT_PARALLEL_WORKERS = 3  # Default: use all TTS model instances
+NUM_TTS_MODELS = 3  # Number of TTS model instances to load (for parallel GPU processing)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
